@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import os
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -124,18 +125,44 @@ def open_index(path: Path):
         db.close()
 
 
-def search(query: str) -> list[dict]:
-    """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
+def search(query: str, *, include_neighbors: bool | None = None) -> list[dict]:
+    """質問を埋め込み、近いページと設定に応じて前後ページを返す。
+
+    include_neighbors が未指定の場合、RAG_INCLUDE_NEIGHBORS=1 なら
+    同じ資料の前後ページも追加する。
+    """
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
     with open_index(RAG_DB) as db:
         vector = embed_text(query.strip(), "RETRIEVAL_QUERY")
+        serialized_vector = sqlite_vec.serialize_float32(vector)
         rows = db.execute("""
             SELECT page_id, document_id, lecture, document_title, section, title, page, content,
                    vec_distance_cosine(embedding, ?) AS distance
             FROM chunks ORDER BY distance, page_id LIMIT ?
-        """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
-        return [dict(row) for row in rows]
+        """, (serialized_vector, RAG_TOP_K))
+        hits = [dict(row) for row in rows]
+        if include_neighbors is None:
+            include_neighbors = os.getenv("RAG_INCLUDE_NEIGHBORS", "0").strip() == "1"
+        if not include_neighbors:
+            return hits
+
+        seen_page_ids = {hit["page_id"] for hit in hits}
+        neighbors = []
+        for hit in hits:
+            adjacent_rows = db.execute("""
+                SELECT page_id, document_id, lecture, document_title, section, title, page, content,
+                       vec_distance_cosine(embedding, ?) AS distance
+                FROM chunks
+                WHERE document_id = ? AND page IN (?, ?)
+                ORDER BY page, page_id
+            """, (serialized_vector, hit["document_id"], hit["page"] - 1, hit["page"] + 1))
+            for row in adjacent_rows:
+                neighbor = dict(row)
+                if neighbor["page_id"] not in seen_page_ids:
+                    seen_page_ids.add(neighbor["page_id"])
+                    neighbors.append(neighbor)
+        return hits + neighbors
 
 
 def search_graph(query: str) -> dict:
@@ -151,7 +178,9 @@ def search_graph(query: str) -> dict:
             adjacent[a].add(b)
             adjacent[b].add(a)
 
-    seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
+    seeds = [hit for hit in search(query, include_neighbors=False) if hit["page_id"] in pages][
+        :min(GRAPH_START_K, GRAPH_MAX_RESULTS)
+    ]
     seed_ids = {seed["page_id"] for seed in seeds}
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):

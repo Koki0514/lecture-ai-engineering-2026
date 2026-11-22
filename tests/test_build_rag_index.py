@@ -42,6 +42,59 @@ def test_built_index_can_be_searched(materials, monkeypatch):
     assert hits[0]["distance"] == pytest.approx(0)
 
 
+def test_search_can_include_unique_neighbors_from_the_same_document(tmp_path, monkeypatch):
+    source = tmp_path / "lectures.json"
+    database = tmp_path / "index.sqlite3"
+    documents = [
+        {"id": "lec01-main", "title": "講義1", "content": [
+            {"section": "章", "content": [
+                {"id": f"lec01-main-p{page:03d}", "title": f"ページ{page}",
+                 "page": page, "content": {1: "近い", 2: "一致", 3: "隣接"}[page]}
+                for page in (1, 2, 3)]}]},
+        {"id": "lec02-main", "title": "講義2", "content": [
+            {"section": "章", "content": [
+                {"id": "lec02-main-p002", "title": "別資料のページ2",
+                 "page": 2, "content": "別資料"}]}]},
+    ]
+    source.write_text(json.dumps(documents, ensure_ascii=False), encoding="utf-8")
+
+    def embed(text, task):
+        assert task == "RETRIEVAL_DOCUMENT"
+        if "一致" in text:
+            return [1, 0]
+        if "近い" in text:
+            return [0.99, 0.1]
+        return [0, 1]
+
+    build_index(source, database, embedder=embed)
+    monkeypatch.setattr(retrieval, "RAG_DB", database)
+    monkeypatch.setattr(retrieval, "RAG_TOP_K", 2)
+    monkeypatch.setattr(retrieval, "embed_text", lambda *_: [1, 0])
+    monkeypatch.delenv("RAG_INCLUDE_NEIGHBORS", raising=False)
+
+    regular_hits = retrieval.search("質問")
+    assert [hit["page_id"] for hit in regular_hits] == [
+        "lec01-main-p002", "lec01-main-p001",
+    ]
+
+    monkeypatch.setenv("RAG_INCLUDE_NEIGHBORS", "1")
+    expanded_hits = retrieval.search("質問")
+    assert [hit["page_id"] for hit in expanded_hits] == [
+        "lec01-main-p002", "lec01-main-p001", "lec01-main-p003",
+    ]
+    assert [hit["page_id"] for hit in retrieval.search(
+        "質問", include_neighbors=False,
+    )] == [hit["page_id"] for hit in regular_hits]
+    assert len({hit["page_id"] for hit in expanded_hits}) == len(expanded_hits)
+    assert all(hit["document_id"] == "lec01-main" for hit in expanded_hits)
+    assert all(set(hit) == set(regular_hits[0]) for hit in expanded_hits)
+
+    monkeypatch.setattr(retrieval, "RAG_TOP_K", 1)
+    assert [hit["page_id"] for hit in retrieval.search("質問")] == [
+        "lec01-main-p002", "lec01-main-p001", "lec01-main-p003",
+    ]
+
+
 def test_existing_index_survives_failed_rebuild(materials):
     source, database = materials
     build_index(source, database, embedder=lambda *_: [1, 0])
